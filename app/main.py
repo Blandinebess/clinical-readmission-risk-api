@@ -1,69 +1,71 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import joblib
+import pandas as pd
 import numpy as np
-import os
 
 app = FastAPI(
-    title="Clinical Readmission Risk API",
-    description="Production-grade API for predicting patient readmission risk.",
-    version="1.0.0"
+    title="Clinical Readmission Risk & Interpretability API",
+    description="API for predicting hospital readmission risk and providing SHAP-based feature importance explanations.",
+    version="2.0.0"
 )
 
-# Load the trained model artifact
-MODEL_PATH = "model.joblib"
-
-if os.path.exists(MODEL_PATH):
-    model = joblib.load(MODEL_PATH)
-else:
+# Load trained model and SHAP explainer
+try:
+    model = joblib.load("model.joblib")
+    explainer = joblib.load("explainer.joblib")
+except Exception as e:
     model = None
+    explainer = None
 
-# Input schema matching model training features
 class PatientData(BaseModel):
-    age: int
-    num_lab_procedures: int
-    num_medications: int
-    time_in_hospital: int
-    number_diagnoses: int
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "age": 65,
-                "num_lab_procedures": 45,
-                "num_medications": 12,
-                "time_in_hospital": 4,
-                "number_diagnoses": 5
-            }
-        }
+    age: int = Field(..., ge=0, le=120, example=65)
+    num_lab_procedures: int = Field(..., ge=0, example=45)
+    num_medications: int = Field(..., ge=0, example=12)
+    time_in_hospital: int = Field(..., ge=1, example=4)
+    number_diagnoses: int = Field(..., ge=1, example=5)
 
 @app.get("/")
-def health_check():
+def read_root():
     return {
-        "status": "online",
+        "service": "Clinical Readmission Risk API",
+        "status": "active",
         "model_loaded": model is not None
     }
 
 @app.post("/predict")
 def predict_readmission(patient: PatientData):
-    if model is None:
-        raise HTTPException(status_code=500, detail="Model file not found. Run train_clinical_model.py first.")
-
-    # Convert incoming JSON data to model input array
-    features = np.array([[
-        patient.age,
-        patient.num_lab_procedures,
-        patient.num_medications,
-        patient.time_in_hospital,
-        patient.number_diagnoses
-    ]])
-
-    # Generate prediction and risk probability
-    prediction = int(model.predict(features)[0])
-    probability = float(model.predict_proba(features)[0][1])
-
+    if model is None or explainer is None:
+        raise HTTPException(status_code=500, detail="Model or explainer artifact not loaded.")
+    
+    # Format input data
+    input_df = pd.DataFrame([patient.model_dump()])
+    
+    # Calculate probability and prediction
+    prob_readmission = float(model.predict_proba(input_df)[0][1])
+    prediction = int(model.predict(input_df)[0])
+    
+    # Determine risk category
+    if prob_readmission >= 0.7:
+        risk_category = "High Risk"
+    elif prob_readmission >= 0.4:
+        risk_category = "Moderate Risk"
+    else:
+        risk_category = "Low Risk"
+        
+    # Calculate SHAP values for clinical interpretability
+    shap_values = explainer(input_df)
+    # Get SHAP impact values for class 1 (readmission)
+    if len(shap_values.values.shape) == 3:
+        feature_impacts = shap_values.values[0, :, 1].tolist()
+    else:
+        feature_impacts = shap_values.values[0].tolist()
+        
+    feature_importance = dict(zip(input_df.columns, feature_impacts))
+    
     return {
         "readmission_predicted": bool(prediction),
-        "readmission_risk_score": round(probability, 4),
-        "risk_category": "High Risk" if probability >= 0.5 else "Low Risk"
+        "readmission_risk_score": round(prob_readmission, 4),
+        "risk_category": risk_category,
+        "feature_contributions": feature_importance
     }
